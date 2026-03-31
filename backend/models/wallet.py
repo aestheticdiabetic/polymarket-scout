@@ -47,6 +47,7 @@ class WalletScore(BaseModel):
     conviction_win_rate: float = 0.0     # win rate specifically on above-average bets
     conviction_win_rate_delta: float = 0.0  # conviction_win_rate minus overall win_rate (positive = big bets win more)
     exit_cleanliness: float = 0.0        # fraction of market exits completed in a single sell tx (1.0 = always clean)
+    tradeable_rate: float = 0.0          # fraction of buy trades with price <= copier entry ceiling (0.80)
 
     # Computed composite
     composite_score: float               # 0-100
@@ -118,15 +119,18 @@ class ScanResult(BaseModel):
 class ScoreWeights(BaseModel):
     """Sent from the dashboard config panel to update scoring on the fly."""
     min_trades: int = 20
-    min_win_rate: float = 0.55
-    min_roi: float = 0.10
+    min_win_rate: float = 0.60
+    min_roi: float = 0.40
     min_markets: int = 3
-    min_exit_cleanliness: float = 0.40
-    early_entry_weight: float = 0.25
-    win_rate_weight: float = 0.25
-    roi_weight: float = 0.10
-    consistency_weight: float = 0.05
-    conviction_quality_weight: float = 0.30
+    min_exit_cleanliness: float = 0.25
+    max_avg_entry_price: float = 0.85
+    min_tradeable_rate: float = 0.50
+    early_entry_weight: float = 0.15
+    win_rate_weight: float = 0.20
+    roi_weight: float = 0.05
+    consistency_weight: float = 0.00
+    conviction_quality_weight: float = 0.25
     exit_cleanliness_weight: float = 0.20
+    bet_size_cv_weight: float = 0.15
     arb_max_hold_seconds: int = 300
     rotation_similarity_threshold: float = 0.70

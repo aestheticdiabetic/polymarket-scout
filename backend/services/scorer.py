@@ -23,10 +23,13 @@ class ScoringEngine:
         self.consistency_w = w.get("consistency_weight", settings.consistency_weight)
         self.conviction_quality_w = w.get("conviction_quality_weight", settings.conviction_quality_weight)
         self.exit_cleanliness_w = w.get("exit_cleanliness_weight", settings.exit_cleanliness_weight)
+        self.bet_size_cv_w = w.get("bet_size_cv_weight", settings.bet_size_cv_weight)
         self.arb_max_hold = w.get("arb_max_hold_seconds", settings.arb_max_hold_seconds)
         self.arb_position_ratio = w.get("arb_max_position_ratio", settings.arb_max_position_ratio)
         self.min_trades = w.get("min_trades", settings.min_trades)
         self.min_exit_cleanliness = w.get("min_exit_cleanliness", settings.min_exit_cleanliness)
+        self.max_avg_entry_price = w.get("max_avg_entry_price", settings.max_avg_entry_price)
+        self.min_tradeable_rate = w.get("min_tradeable_rate", settings.min_tradeable_rate)
 
     def score(
         self,
@@ -53,14 +56,7 @@ class ScoringEngine:
         # Realized returns = actual USDC received from SELL trades (confirmed exits)
         sell_proceeds = sum(t.size_usdc for t in sell_trades)
 
-        # Theoretical payout for positions held to resolution and won:
-        # size_usdc / price = shares bought; each share pays $1 at resolution.
-        # Only count BUY trades (not SELLs) to avoid double-counting.
-        won_buy_trades = [t for t in won if t.direction == TradeDirection.BUY]
-        held_won_payout = sum(
-            t.size_usdc / t.price for t in won_buy_trades if t.price > 0
-        )
-
+        # Build sells_by_market first — needed to exclude sold markets from held_won_payout.
         # ROI is calculated on CLOSED positions only (resolved or manually sold out).
         # Open (unresolved) positions are excluded from both numerator and denominator
         # so an early-stage wallet with mostly open positions doesn't look like a 100%
@@ -68,6 +64,17 @@ class ScoringEngine:
         sells_by_market: Dict[str, float] = defaultdict(float)
         for t in sell_trades:
             sells_by_market[t.market_id] += t.size_usdc
+
+        # Theoretical payout for positions held to resolution and won.
+        # IMPORTANT: exclude markets where the wallet sold — those proceeds are already
+        # captured in sell_proceeds. Counting both would double-count the return.
+        # size_usdc / price = shares bought; each share pays $1 at resolution.
+        sold_markets = set(sells_by_market.keys())
+        won_buy_trades = [t for t in won if t.direction == TradeDirection.BUY]
+        held_won_payout = sum(
+            t.size_usdc / t.price for t in won_buy_trades
+            if t.price > 0 and t.market_id not in sold_markets
+        )
 
         closed_invested = 0.0
         closed_returned = 0.0
@@ -86,10 +93,21 @@ class ScoringEngine:
         markets = set(t.market_id for t in trades)
         distinct_markets = len(markets)
 
-        # ---- Average bet size ----
+        # ---- Average bet size & bet size CV ----
         avg_bet_size_usdc = (
             sum(t.size_usdc for t in buy_trades) / len(buy_trades) if buy_trades else 0.0
         )
+        if len(buy_trades) >= 2 and avg_bet_size_usdc > 0:
+            sizes = [t.size_usdc for t in buy_trades]
+            variance = sum((s - avg_bet_size_usdc) ** 2 for s in sizes) / len(sizes)
+            computed_bet_size_cv = variance ** 0.5 / avg_bet_size_usdc
+        else:
+            computed_bet_size_cv = 0.0
+
+        # ---- Tradeable rate ----
+        # Fraction of buy trades the copier will actually enter (price <= entry ceiling).
+        tradeable_buys = [t for t in buy_trades if t.price <= settings.copier_max_entry_price]
+        tradeable_rate = len(tradeable_buys) / len(buy_trades) if buy_trades else 0.0
 
         # ---- Conviction quality ----
         # Win rate specifically on above-average bets vs overall win rate.
@@ -121,8 +139,9 @@ class ScoringEngine:
         # Trades entered when odds were still underpriced (low p on winners) score higher.
         early_scores: List[float] = []
         for t in resolved:
-            if t.won and t.market_final_price is not None:
-                # Price moved from entry to 1.0 — bigger move = earlier entry
+            if t.won and t.direction == TradeDirection.BUY:
+                # Price moved from entry to 1.0 — bigger move = earlier entry.
+                # Only BUY trades: we want the entry price, not the exit/sell price.
                 price_appreciation = max(0.0, 1.0 - t.price)
                 early_scores.append(price_appreciation)
 
@@ -155,11 +174,13 @@ class ScoringEngine:
         cq_norm = (conviction_win_rate_delta + 1.0) / 2.0
         # exit_cleanliness already in [0, 1]
         ec_norm = exit_cleanliness
+        # bet_size_cv: cap at 2.0 (above this is noise/outliers)
+        cv_norm = min(computed_bet_size_cv / 2.0, 1.0)
 
         total_w = (
             self.win_rate_w + self.roi_w + self.early_entry_w
             + self.consistency_w + self.conviction_quality_w
-            + self.exit_cleanliness_w
+            + self.exit_cleanliness_w + self.bet_size_cv_w
         )
         raw = (
             self.win_rate_w * wr_norm
@@ -168,6 +189,7 @@ class ScoringEngine:
             + self.consistency_w * cons_norm
             + self.conviction_quality_w * cq_norm
             + self.exit_cleanliness_w * ec_norm
+            + self.bet_size_cv_w * cv_norm
         ) / total_w
         composite = round(raw * 100, 2)
 
@@ -192,9 +214,11 @@ class ScoringEngine:
             avg_market_open_price=round(avg_market_open_price, 4),
             early_entry_score=round(early_entry_score, 4),
             avg_bet_size_usdc=round(avg_bet_size_usdc, 2),
+            bet_size_cv=round(computed_bet_size_cv, 4),
             conviction_win_rate=round(conviction_win_rate, 4),
             conviction_win_rate_delta=round(conviction_win_rate_delta, 4),
             exit_cleanliness=round(exit_cleanliness, 4),
+            tradeable_rate=round(tradeable_rate, 4),
             composite_score=composite,
             arb_flag=arb_flag,
             arb_reason=arb_reason,
@@ -204,12 +228,14 @@ class ScoringEngine:
         )
 
     def passes_filters(self, score: WalletScore) -> bool:
-        """Returns True if the wallet meets the minimum thresholds to be a candidate."""
-        if score.arb_flag:
-            return False
-        # Win rate and ROI filters require enough resolved trades to be meaningful.
-        # Wallets with mostly unresolved markets are kept until evidence says otherwise.
-        if score.resolved_trades >= 5:
+        """Returns True if the wallet meets the minimum thresholds to be a candidate.
+
+        Note: arb_flag is NOT a hard filter here — arb wallets remain in candidates
+        but receive a 70% score penalty and are clearly labelled in the dashboard.
+        """
+        # Win rate and ROI filters require at least 15 resolved trades to be meaningful.
+        # Wallets with fewer resolved markets are filtered out — insufficient track record.
+        if score.resolved_trades >= 15:
             if score.win_rate < settings.min_win_rate:
                 return False
             if score.roi < settings.min_roi:
@@ -218,6 +244,12 @@ class ScoringEngine:
             return False
         if score.exit_cleanliness < self.min_exit_cleanliness:
             return False
+        # Entry price filters — only apply when there is enough buy history.
+        if score.total_trades >= 10:
+            if score.avg_entry_price > self.max_avg_entry_price:
+                return False
+            if score.tradeable_rate < self.min_tradeable_rate:
+                return False
         return True
 
     # ---- Arb detection helpers ----

@@ -114,8 +114,10 @@ WALLET ROTATION DETECTED:
     return f"""You are analysing a Polymarket prediction market trader for copy-trading suitability.
 
 MY COPY BOT — HOW IT WORKS:
-- Automated copy-trading bot on Polymarket. ~4 second execution delay from on-chain detection to order placement.
-- Professional competing bots operate at ~0.2s. I cannot exploit arbitrage or any latency-sensitive strategy.
+- Automated copy-trading bot on Polymarket.
+- ENTRY detection via CLOB WebSocket: ~200ms from whale fill to detection. Total entry latency ~1-3s (detection + order signing + CLOB round-trip).
+- EXIT detection via on-chain block monitoring: ~4s latency. This is real lag — whale sells that happen during fast-moving resolution windows may have large price moves before I can follow.
+- Professional competing bots for entry operate at ~0.2s. I cannot exploit arbitrage or any latency-sensitive entry strategy, but my entry lag is low enough for most normal markets.
 - CONVICTION-EXPONENT SIZING: My bot does NOT copy flat. Bets significantly above the wallet's average are copied with disproportionately larger size (exponent ~1.5). A bet 2x their average triggers ~2.8x my normal copy size. This means I benefit most from wallets who occasionally make very large bets relative to their norm — wallets with flat consistent sizing give me no amplification signal.
 - ENTRY FILTER: In live mode I skip entries above 0.80 probability. Wallets who primarily trade heavy favourites (>80% implied probability) will have most of their trades skipped entirely.
 - EXIT DETECTION: I track exits via on-chain chain monitoring. Clean exits (single sell transaction per market) are reliably detected. Wallets who drip-sell across multiple transactions per market are harder to follow cleanly.

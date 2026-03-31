@@ -1,4 +1,3 @@
-import asyncio
 import logging
 import os
 
@@ -42,16 +41,7 @@ async def startup():
         replace_existing=True,
     )
     scheduler.start()
-    log.info(f"Scheduler started — scanning every {settings.scan_interval_minutes} min")
-
-    # Run an initial scan on startup (in background so server starts fast)
-    asyncio.create_task(_initial_scan())
-
-
-async def _initial_scan():
-    await asyncio.sleep(3)  # give server time to fully start
-    log.info("Running initial scan on startup...")
-    await run_scan()
+    log.info(f"Scheduler started — first scan in {settings.scan_interval_minutes} min")
 
 
 @app.on_event("shutdown")

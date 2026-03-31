@@ -5,6 +5,7 @@ Fetches trade data from the Polymarket public data API.
   3. lb-api.polymarket.com/profit     — leaderboard for top-performer discovery
   4. CLOB prices-history              — opening prices for early-entry scoring
 """
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
@@ -16,6 +17,10 @@ from config import settings
 from models.wallet import Trade, TradeDirection
 
 log = logging.getLogger(__name__)
+
+# Limit concurrent CLOB API requests to avoid 429s
+_CLOB_SEMAPHORE = asyncio.Semaphore(5)
+_CLOB_RETRY_DELAYS = [1, 2, 4]  # seconds between retries on 429
 
 _SHORT_TERM_SLUG_PATTERNS = (
     "-updown-",       # BTC/ETH up-or-down markets
@@ -116,24 +121,44 @@ class PolymarketFetcher:
         _, username = await self._activity_trades(wallet, limit=1)
         return username
 
+    async def _clob_get(self, url: str, **kwargs) -> Optional[httpx.Response]:
+        """GET wrapper with semaphore and 429 retry backoff for CLOB API calls."""
+        client = await self._http()
+        async with _CLOB_SEMAPHORE:
+            for attempt, delay in enumerate([0] + _CLOB_RETRY_DELAYS):
+                if delay:
+                    await asyncio.sleep(delay)
+                try:
+                    r = await client.get(url, **kwargs)
+                    if r.status_code == 429:
+                        if attempt < len(_CLOB_RETRY_DELAYS):
+                            log.debug(f"CLOB 429 on {url}, retry {attempt + 1}")
+                            continue
+                        log.warning(f"CLOB 429 exhausted retries for {url}")
+                        return None
+                    return r
+                except Exception as e:
+                    log.debug(f"CLOB request failed for {url}: {e}")
+                    return None
+        return None
+
     async def get_market_open_price(self, market_id: str, outcome: str) -> Optional[float]:
         """
         Returns the opening price of a market outcome from the CLOB price history.
         Used to score early entry.
         """
-        client = await self._http()
+        r = await self._clob_get(
+            f"{self.clob}/prices-history",
+            params={"market": market_id, "startTs": 0, "interval": "1h", "fidelity": 60},
+        )
+        if r is None or r.status_code != 200:
+            return None
         try:
-            r = await client.get(
-                f"{self.clob}/prices-history",
-                params={"market": market_id, "startTs": 0, "interval": "1h", "fidelity": 60},
-            )
-            r.raise_for_status()
-            data = r.json()
-            history = data.get("history", [])
+            history = r.json().get("history", [])
             if history:
                 return float(history[0].get("p", 0.5))
         except Exception as e:
-            log.debug(f"Price history fetch failed for {market_id}: {e}")
+            log.debug(f"Price history parse failed for {market_id}: {e}")
         return None
 
     async def get_market_resolution_data(self, condition_id: str) -> Optional[dict]:
@@ -147,11 +172,10 @@ class PolymarketFetcher:
           }
         Returns None if the market cannot be looked up.
         """
-        client = await self._http()
+        r = await self._clob_get(f"{self.clob}/markets/{condition_id}", timeout=10)
+        if r is None or r.status_code != 200:
+            return None
         try:
-            r = await client.get(f"{self.clob}/markets/{condition_id}", timeout=10)
-            if r.status_code != 200:
-                return None
             data = r.json()
             closed = bool(data.get("closed", False))
             tokens = data.get("tokens", [])
@@ -164,39 +188,46 @@ class PolymarketFetcher:
                     outcome_winners[outcome_name] = winner
             return {"closed": closed, "outcome_winners": outcome_winners}
         except Exception as e:
-            log.debug(f"Market resolution fetch failed for {condition_id}: {e}")
+            log.debug(f"Market resolution parse failed for {condition_id}: {e}")
         return None
 
     async def get_wallet_funding_source(self, wallet: str) -> Optional[str]:
         """
-        Traces the first funding transaction for a wallet on Polygon.
-        Returns the sending address (the 'parent' or funding source).
+        Traces the first USDC transfer into a wallet on Polygon using the Alchemy
+        Asset Transfers API (alchemy_getAssetTransfers). This replaces the previous
+        Uniswap V3 subgraph query which returned no data for Polymarket wallets.
+
+        Returns the sending address of the earliest inbound USDC transfer.
         Used for rotation detection.
         """
+        # Derive Alchemy base URL from POLYGON_RPC_URL
+        # e.g. https://polygon-mainnet.g.alchemy.com/v2/<key>
+        rpc_url = settings.polygon_rpc_url
+        if "alchemy.com" not in rpc_url:
+            log.debug("Funding source lookup requires Alchemy RPC URL — skipping")
+            return None
+
         try:
             client = await self._http()
-            query = """
-            {
-              transfers(
-                where: { to: "%s" }
-                orderBy: timestamp
-                orderDirection: asc
-                first: 1
-              ) {
-                from
-                timestamp
-                value
-              }
+            payload = {
+                "id": 1,
+                "jsonrpc": "2.0",
+                "method": "alchemy_getAssetTransfers",
+                "params": [{
+                    "fromBlock": "0x0",
+                    "toAddress": wallet,
+                    "contractAddresses": [
+                        "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",  # USDC (PoS)
+                        "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",  # USDC (native)
+                    ],
+                    "category": ["erc20"],
+                    "order": "asc",
+                    "maxCount": "0x1",
+                }],
             }
-            """ % wallet.lower()
-
-            r = await client.post(
-                "https://api.thegraph.com/subgraphs/name/uniswap/uniswap-v3-polygon",
-                json={"query": query},
-                timeout=10,
-            )
+            r = await client.post(rpc_url, json=payload, timeout=10)
             data = r.json()
-            transfers = data.get("data", {}).get("transfers", [])
+            transfers = data.get("result", {}).get("transfers", [])
             if transfers:
                 return transfers[0]["from"].lower()
         except Exception as e:

@@ -245,6 +245,13 @@ async def rescore_all_candidates() -> dict:
                     counters["evicted"] += 1
                     return
 
+                # Auto viability screening
+                viability, viability_reasons = _compute_viability(score)
+                score = score.model_copy(update={
+                    "copy_trade_viability": viability,
+                    "viability_reasons": viability_reasons,
+                })
+
                 # Preserve user-added fields
                 existing = _candidates.get(wallet)
                 if existing:
@@ -278,6 +285,57 @@ def set_weights(weights: dict):
     global _current_weights
     _current_weights = weights
     log.info(f"Scoring weights updated: {weights}")
+
+
+def _compute_viability(score: WalletScore) -> tuple[str, list[str]]:
+    """
+    Auto-screens a wallet for obvious bot/suspect patterns using config thresholds.
+    Returns (viability: str, reasons: list[str]) where viability is one of:
+      VIABLE | SUSPECT | LIKELY_BOT
+    """
+    reasons: list[str] = []
+    viability = "VIABLE"
+
+    # Micro-trader: avg trade size is tiny with a large number of trades → likely bot/market maker
+    if (
+        score.total_trades >= settings.viability_min_trades_for_size_check
+        and score.avg_bet_size_usdc < settings.viability_max_avg_trade_usdc
+    ):
+        reasons.append(
+            f"Avg trade ${score.avg_bet_size_usdc:.2f} with {score.total_trades} trades — likely market maker or bot"
+        )
+        viability = "LIKELY_BOT"
+
+    # Suspicious win rate: near-perfect record on a small resolved sample is implausible
+    if (
+        score.total_trades >= settings.viability_min_trades_for_win_rate_check
+        and score.resolved_trades <= settings.viability_max_resolved_for_win_rate_check
+        and score.resolved_trades >= 5
+        and score.win_rate >= settings.viability_suspicious_win_rate
+    ):
+        reasons.append(
+            f"Win rate {score.win_rate:.0%} on only {score.resolved_trades} resolved trades — suspect"
+        )
+        if viability == "VIABLE":
+            viability = "SUSPECT"
+
+    # Extreme ROI: statistically implausible returns → suspect manipulation or arb
+    if score.roi > settings.viability_max_roi:
+        reasons.append(f"ROI {score.roi:.0%} exceeds plausibility threshold")
+        if viability == "VIABLE":
+            viability = "SUSPECT"
+
+    # Concentrated trader: very high trades-per-market → cycling the same markets repeatedly
+    if score.distinct_markets > 0:
+        trades_per_market = score.total_trades / score.distinct_markets
+        if trades_per_market > settings.viability_max_trades_per_market:
+            reasons.append(
+                f"{trades_per_market:.0f} trades/market — may be cycling the same positions"
+            )
+            if viability == "VIABLE":
+                viability = "SUSPECT"
+
+    return viability, reasons
 
 
 def _enrich_trades(trades: List, resolution_cache: Dict[str, dict]) -> List:
@@ -328,153 +386,153 @@ async def run_scan() -> ScanResult:
         result.wallets_scanned = len(wallets)
         log.info(f"[{scan_id}] Scanning {len(wallets)} wallets...")
 
-        new_count = 0
-        rotation_count = 0
-        skipped_count = 0
+        counters = {"new": 0, "rotations": 0, "skipped": 0}
         now = datetime.now(tz=timezone.utc)
         rescore_cutoff = now - timedelta(hours=RESCORE_HOURS)
 
-        # Cache market open prices and resolution data across wallets in this scan
+        # Shared caches across all concurrent wallet tasks
         market_price_cache: Dict[str, float] = {}
-        market_resolution_cache: Dict[str, dict] = {}  # conditionId → {closed, outcome_winners}
+        market_resolution_cache: Dict[str, dict] = {}
 
-        for wallet in wallets:
-            try:
-                # Skip permanently blacklisted wallets
-                if wallet in _blacklist:
-                    skipped_count += 1
-                    continue
+        # Semaphore limits concurrent wallet processing (I/O bound — activity fetches)
+        wallet_sem = asyncio.Semaphore(20)
 
-                # Skip existing candidates that were scored recently — avoid re-fetching
-                # the same 300 wallets every cycle. New wallets are always processed.
-                if wallet in _candidates and wallet in _last_scored_at:
-                    if _last_scored_at[wallet] > rescore_cutoff:
-                        skipped_count += 1
-                        continue
+        async def _process_wallet(wallet: str):
+            async with wallet_sem:
+                try:
+                    if wallet in _blacklist:
+                        counters["skipped"] += 1
+                        return
+                    if wallet in _candidates and wallet in _last_scored_at:
+                        if _last_scored_at[wallet] > rescore_cutoff:
+                            counters["skipped"] += 1
+                            return
 
-                trades, username = await fetcher._activity_trades(wallet)
-                trades = sorted(trades, key=lambda t: t.timestamp)
-                if not trades:
-                    continue
+                    trades, username = await fetcher._activity_trades(wallet)
+                    trades = sorted(trades, key=lambda t: t.timestamp)
+                    if not trades:
+                        return
 
-                # Fetch opening prices and resolution data for unseen markets this scan
-                unique_markets = [
-                    mid for mid in {t.market_id for t in trades if t.market_id != "unknown"}
-                    if mid not in market_price_cache
-                ]
-                if unique_markets:
-                    price_results = await asyncio.gather(
-                        *[fetcher.get_market_open_price(mid, "YES") for mid in unique_markets],
-                        return_exceptions=True,
-                    )
-                    for mid, pr in zip(unique_markets, price_results):
-                        if isinstance(pr, float):
-                            market_price_cache[mid] = pr
+                    unique_markets = [
+                        mid for mid in {t.market_id for t in trades if t.market_id != "unknown"}
+                        if mid not in market_price_cache
+                    ]
+                    if unique_markets:
+                        price_results = await asyncio.gather(
+                            *[fetcher.get_market_open_price(mid, "YES") for mid in unique_markets],
+                            return_exceptions=True,
+                        )
+                        for mid, pr in zip(unique_markets, price_results):
+                            if isinstance(pr, float):
+                                market_price_cache[mid] = pr
 
-                # Fetch resolution data (closed + winner) for unseen markets this scan
-                unique_markets_for_resolution = [
-                    mid for mid in {t.market_id for t in trades if t.market_id != "unknown"}
-                    if mid not in market_resolution_cache
-                ]
-                if unique_markets_for_resolution:
-                    res_results = await asyncio.gather(
-                        *[fetcher.get_market_resolution_data(mid) for mid in unique_markets_for_resolution],
-                        return_exceptions=True,
-                    )
-                    for mid, res in zip(unique_markets_for_resolution, res_results):
-                        if isinstance(res, dict):
-                            market_resolution_cache[mid] = res
+                    unique_for_res = [
+                        mid for mid in {t.market_id for t in trades if t.market_id != "unknown"}
+                        if mid not in market_resolution_cache
+                    ]
+                    if unique_for_res:
+                        res_results = await asyncio.gather(
+                            *[fetcher.get_market_resolution_data(mid) for mid in unique_for_res],
+                            return_exceptions=True,
+                        )
+                        for mid, res in zip(unique_for_res, res_results):
+                            if isinstance(res, dict):
+                                market_resolution_cache[mid] = res
 
-                # Enrich trades with resolved/won using the resolution cache
-                enriched_trades = _enrich_trades(trades, market_resolution_cache)
+                    enriched_trades = _enrich_trades(trades, market_resolution_cache)
+                    score = scorer.score(wallet, enriched_trades, market_open_prices=market_price_cache)
+                    if score is not None and username:
+                        score = score.model_copy(update={"username": username})
+                    if score is None:
+                        return
 
-                score = scorer.score(wallet, enriched_trades, market_open_prices=market_price_cache)
-                if score is not None and username:
-                    score = score.model_copy(update={"username": username})
-                if score is None:
-                    continue
+                    if not scorer.passes_filters(score):
+                        _last_scored_at[wallet] = now
+                        if wallet in _candidates:
+                            del _candidates[wallet]
+                            log.info(f"[{scan_id}] Evicted {wallet[:10]}... — no longer passes filters")
+                        return
 
-                if not scorer.passes_filters(score):
-                    _last_scored_at[wallet] = now
-                    # Evict from candidates if it was previously accepted but no longer passes
-                    if wallet in _candidates:
-                        del _candidates[wallet]
-                        log.info(f"[{scan_id}] Evicted {wallet[:10]}... — no longer passes filters")
-                    continue
-
-                # Rotation detection
-                funding_source = await fetcher.get_wallet_funding_source(wallet)
-                detector.register_trades(wallet, trades)
-                link = detector.find_rotation(
-                    candidate_wallet=wallet,
-                    candidate_trades=trades,
-                    candidate_funding_source=funding_source,
-                )
-
-                if link:
-                    score.linked_from = link.old_wallet
-                    score.rotation_confidence = link.confidence
-                    score.rotation_signals = link.signals
-                    _rotations.append(link)
-                    rotation_count += 1
-                    log.info(f"[{scan_id}] Rotation detected: {link.old_wallet[:8]}... → {wallet[:8]}... (conf={link.confidence:.0%})")
-
-                # Mark as new if we haven't seen this wallet before
-                is_new = wallet not in _candidates
-                score.is_new = is_new
-
-                # Preserve user-added fields from the existing candidate
-                if wallet in _candidates:
-                    existing = _candidates[wallet]
+                    viability, viability_reasons = _compute_viability(score)
                     score = score.model_copy(update={
-                        "note": existing.note,
-                        "ai_review": existing.ai_review,
-                        "ai_review_at": existing.ai_review_at,
-                        "ai_review_pending": existing.ai_review_pending,
-                        # Keep existing username if the fresh fetch returned nothing
-                        "username": score.username or existing.username,
+                        "copy_trade_viability": viability,
+                        "viability_reasons": viability_reasons,
                     })
 
-                _candidates[wallet] = score
-                _last_scored_at[wallet] = now
+                    funding_source = await fetcher.get_wallet_funding_source(wallet)
+                    detector.register_trades(wallet, trades)
+                    link = detector.find_rotation(
+                        candidate_wallet=wallet,
+                        candidate_trades=trades,
+                        candidate_funding_source=funding_source,
+                    )
+                    if link:
+                        score.linked_from = link.old_wallet
+                        score.rotation_confidence = link.confidence
+                        score.rotation_signals = link.signals
+                        _rotations.append(link)
+                        counters["rotations"] += 1
+                        log.info(f"[{scan_id}] Rotation detected: {link.old_wallet[:8]}... → {wallet[:8]}... (conf={link.confidence:.0%})")
 
-                if is_new:
-                    new_count += 1
-                    await maybe_alert(score)
+                    is_new = wallet not in _candidates
+                    score.is_new = is_new
 
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                log.warning(f"[{scan_id}] Error processing {wallet[:10]}...: {e}")
-                result.errors.append(f"{wallet[:10]}: {e}")
+                    if wallet in _candidates:
+                        existing = _candidates[wallet]
+                        score = score.model_copy(update={
+                            "note": existing.note,
+                            "ai_review": existing.ai_review,
+                            "ai_review_at": existing.ai_review_at,
+                            "ai_review_pending": existing.ai_review_pending,
+                            "username": score.username or existing.username,
+                        })
 
-        result.new_candidates = new_count
-        result.rotation_links_found = rotation_count
+                    _candidates[wallet] = score
+                    _last_scored_at[wallet] = now
 
-        # Backfill usernames for candidates that still have none (e.g. loaded from disk
-        # before username tracking was added, or not in the current active pool).
-        no_username = [w for w, s in _candidates.items() if not s.username]
-        if no_username:
-            log.info(f"[{scan_id}] Backfilling usernames for {len(no_username)} candidates (up to 100)...")
-            backfilled = 0
-            for wallet in no_username[:100]:
-                try:
-                    _, username = await fetcher._activity_trades(wallet, limit=1)
-                    if username and wallet in _candidates:
-                        _candidates[wallet] = _candidates[wallet].model_copy(update={"username": username})
-                        backfilled += 1
+                    if is_new:
+                        counters["new"] += 1
+                        await maybe_alert(score)
+
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    log.debug(f"[{scan_id}] Username backfill failed for {wallet[:10]}: {e}")
-            log.info(f"[{scan_id}] Username backfill: {backfilled}/{min(len(no_username), 100)} filled")
+                    log.warning(f"[{scan_id}] Error processing {wallet[:10]}...: {e}")
+                    result.errors.append(f"{wallet[:10]}: {e}")
+
+        await asyncio.gather(*[_process_wallet(w) for w in wallets])
+
+        result.new_candidates = counters["new"]
+        result.rotation_links_found = counters["rotations"]
+
+        # Backfill usernames concurrently (up to 20 at a time)
+        no_username = [w for w, s in _candidates.items() if not s.username]
+        if no_username:
+            log.info(f"[{scan_id}] Backfilling usernames for {len(no_username)} candidates (up to 100)...")
+            backfill_sem = asyncio.Semaphore(20)
+            backfilled_count = {"n": 0}
+
+            async def _backfill(wallet: str):
+                async with backfill_sem:
+                    try:
+                        _, username = await fetcher._activity_trades(wallet, limit=1)
+                        if username and wallet in _candidates:
+                            _candidates[wallet] = _candidates[wallet].model_copy(update={"username": username})
+                            backfilled_count["n"] += 1
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        log.debug(f"[{scan_id}] Username backfill failed for {wallet[:10]}: {e}")
+
+            await asyncio.gather(*[_backfill(w) for w in no_username[:100]])
+            log.info(f"[{scan_id}] Username backfill: {backfilled_count['n']}/{min(len(no_username), 100)} filled")
 
         result.completed_at = datetime.now(tz=timezone.utc)
 
         log.info(
-            f"[{scan_id}] Done. {new_count} new candidates, "
-            f"{rotation_count} rotation links, "
-            f"{skipped_count} skipped (recently scored or blacklisted), "
+            f"[{scan_id}] Done. {counters['new']} new candidates, "
+            f"{counters['rotations']} rotation links, "
+            f"{counters['skipped']} skipped (recently scored or blacklisted), "
             f"{len(result.errors)} errors"
         )
 
