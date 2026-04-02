@@ -19,8 +19,12 @@ from models.wallet import Trade, TradeDirection
 log = logging.getLogger(__name__)
 
 # Limit concurrent CLOB API requests to avoid 429s
-_CLOB_SEMAPHORE = asyncio.Semaphore(5)
+_CLOB_SEMAPHORE = asyncio.Semaphore(8)
 _CLOB_RETRY_DELAYS = [1, 2, 4]  # seconds between retries on 429
+
+# Deduplicates in-flight CLOB requests — prevents N concurrent wallets all
+# fetching the same popular market simultaneously.
+_clob_inflight: dict[str, asyncio.Future] = {}
 
 _SHORT_TERM_SLUG_PATTERNS = (
     "-updown-",       # BTC/ETH up-or-down markets
@@ -122,25 +126,47 @@ class PolymarketFetcher:
         return username
 
     async def _clob_get(self, url: str, **kwargs) -> Optional[httpx.Response]:
-        """GET wrapper with semaphore and 429 retry backoff for CLOB API calls."""
-        client = await self._http()
-        async with _CLOB_SEMAPHORE:
+        """GET wrapper with semaphore, deduplication, and 429 retry backoff."""
+        # If another coroutine is already fetching this URL, wait for its result
+        if url in _clob_inflight:
+            try:
+                return await asyncio.shield(_clob_inflight[url])
+            except Exception:
+                return None
+
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+        _clob_inflight[url] = fut
+
+        try:
+            client = await self._http()
+            result = None
             for attempt, delay in enumerate([0] + _CLOB_RETRY_DELAYS):
                 if delay:
+                    # Sleep OUTSIDE the semaphore so the slot isn't held during backoff
                     await asyncio.sleep(delay)
                 try:
-                    r = await client.get(url, **kwargs)
+                    async with _CLOB_SEMAPHORE:
+                        r = await client.get(url, **kwargs)
                     if r.status_code == 429:
                         if attempt < len(_CLOB_RETRY_DELAYS):
                             log.debug(f"CLOB 429 on {url}, retry {attempt + 1}")
                             continue
                         log.warning(f"CLOB 429 exhausted retries for {url}")
-                        return None
-                    return r
+                        break
+                    result = r
+                    break
                 except Exception as e:
                     log.debug(f"CLOB request failed for {url}: {e}")
-                    return None
-        return None
+                    break
+            fut.set_result(result)
+            return result
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            return None
+        finally:
+            _clob_inflight.pop(url, None)
 
     async def get_market_open_price(self, market_id: str, outcome: str) -> Optional[float]:
         """
